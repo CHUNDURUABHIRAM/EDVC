@@ -1,0 +1,27 @@
+/* App-level styles for ChargeSpot */
+/* Global utilities are defined in index.css */
+
+/* bg-primary-soft utility referenced in various components */
+.bg-primary-soft {
+  background: var(--primary-glow);
+}
+
+.bg-orange-soft {
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.text-primary {
+  color: var(--primary-color);
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+
+.text-orange {
+  color: var(--status-orange);
+}
+
+.icon {
+  display: inline-block;
+}

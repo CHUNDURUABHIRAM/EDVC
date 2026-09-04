@@ -1,46 +1,47 @@
 import React, { useState, useEffect } from 'react';
 import Sidebar from '../components/layout/Sidebar';
 import { useAuth } from '../context/AuthContext';
-import { getAllBookings, cancelBooking } from '../engines/AllocationEngine';
-import { Calendar, MapPin, Zap, CheckCircle, XCircle, AlertTriangle, Trash2 } from 'lucide-react';
+import { cancelBooking, isCancellationAllowed } from '../engines/AllocationEngine';
+import { useAppState } from '../services/appState';
+import { Calendar, MapPin, Zap, CheckCircle, XCircle, AlertTriangle, Trash2, Clock } from 'lucide-react';
 
 const UserHistory = () => {
   const { user } = useAuth();
-  const [bookings, setBookings] = useState([]);
-  const [stations, setStations] = useState([]);
+  const { stations, bookings: userBookings } = useAppState();
 
   useEffect(() => {
-    if (user) {
-      // Sort bookings by creation date descending
-      const bks = getAllBookings(user.id).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-      setBookings(bks);
-    }
-    const sts = JSON.parse(localStorage.getItem('chargeSpotStations') || '[]');
-    setStations(sts);
-  }, [user]);
+    console.log(`[USER HISTORY DEBUG] current user UID: ${user?.id}`);
+    console.log(`[USER HISTORY DEBUG] using global subscription`);
+  }, [user?.id]);
 
-  const handleCancel = (bookingId) => {
+  const [actionError, setActionError] = useState(null);
+  const bookings = userBookings;
+  
+  useEffect(() => {
+    console.log(`[USER HISTORY DEBUG] rendered bookings count: ${userBookings.length}`);
+    console.log(`[USER HISTORY DEBUG] rendered booking IDs: ${userBookings.map(b => b.id).join(', ')}`);
+  }, [userBookings]);
+
+  const handleCancel = async (bookingId) => {
+    setActionError('');
     if (window.confirm("Are you sure you want to cancel this booking?")) {
-      const updated = cancelBooking(bookingId);
-      // Filter for this user and sort again
-      const myUpdated = updated
-        .filter(b => b.userId === user.id)
-        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-      setBookings(myUpdated);
+      const res = await cancelBooking(bookingId);
+      if (res && res.error) {
+        setActionError(res.error);
+      }
     }
   };
 
   const getStatusIcon = (status) => {
     if (status === 'CONFIRMED' || status === 'COMPLETED') return <CheckCircle size={24} style={{ color: 'var(--status-green)' }} />;
     if (status === 'AT_RISK') return <AlertTriangle size={24} style={{ color: 'var(--status-orange)' }} />;
+    if (status === 'PENDING') return <Clock size={24} style={{ color: '#3b82f6' }} />;
     return <XCircle size={24} style={{ color: 'var(--status-red)' }} />;
   };
 
   const totalSessions = bookings.length;
-  // Estimate: 30 kWh per completed/confirmed session
   const activeAndCompleted = bookings.filter(b => b.status === 'CONFIRMED' || b.status === 'COMPLETED' || b.status === 'AT_RISK');
   const energyCharged = activeAndCompleted.length * 30;
-  // Estimate: 20 mins saved per session
   const waitSaved = activeAndCompleted.length * 20;
 
   return (
@@ -49,6 +50,13 @@ const UserHistory = () => {
       <div className="main-content history-content">
         <h1 className="page-title">Booking History</h1>
         
+        {actionError && (
+          <div className="error-banner mb-20 bg-orange-soft text-orange" style={{ padding: '12px 16px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 10 }}>
+            <AlertTriangle size={18} />
+            <span>{actionError}</span>
+          </div>
+        )}
+
         <div className="stats-row mb-40">
           <div className="stat-card glass-panel">
             <div className="stat-label">Total Bookings</div>
@@ -74,6 +82,8 @@ const UserHistory = () => {
           ) : (
             bookings.map(bk => {
               const st = stations.find(s => s.id === bk.stationId);
+              const cancelInfo = isCancellationAllowed(bk);
+
               return (
                 <div key={bk.id} className={`history-card glass-panel status-${bk.status.toLowerCase()}`}>
                   <div className="hc-left">
@@ -81,9 +91,9 @@ const UserHistory = () => {
                       {getStatusIcon(bk.status)}
                     </div>
                     <div className="hc-info">
-                      <h3 style={{ margin: '0 0 6px', fontSize: '1.2rem' }}>{st?.name || 'Unknown Station'}</h3>
+                      <h3 style={{ margin: '0 0 6px', fontSize: '1.2rem' }}>{st?.name || 'Charging Station'}</h3>
                       <p className="text-muted" style={{ margin: '0 0 12px', display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.9rem' }}>
-                        <MapPin size={14}/> {st?.location || 'Unknown location'}
+                        <MapPin size={14}/> {st?.location || 'Station Location'}
                       </p>
                       <div className="hc-details">
                         <span className="detail-pill"><Calendar size={14}/> {bk.date} at {bk.time}</span>
@@ -97,9 +107,27 @@ const UserHistory = () => {
                     <div className="hc-id">ID: {bk.id}</div>
                     
                     {bk.status === 'CONFIRMED' && (
-                      <button className="cancel-btn" onClick={() => handleCancel(bk.id)}>
-                        <Trash2 size={14} /> Cancel
-                      </button>
+                      <div style={{ marginTop: 8, textAlign: 'right' }}>
+                        {cancelInfo.allowed ? (
+                          <>
+                            <button className="cancel-btn" onClick={() => handleCancel(bk.id)}>
+                              <Trash2 size={14} /> Cancel Booking
+                            </button>
+                            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--primary-color)', marginTop: 4 }}>
+                              <Clock size={11} style={{ verticalAlign: '-1px' }} /> {cancelInfo.message}
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <button className="cancel-btn disabled" disabled style={{ opacity: 0.5, cursor: 'not-allowed' }}>
+                              <Trash2 size={14} /> Cancel Booking
+                            </button>
+                            <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--status-orange)', marginTop: 4, maxWidth: 220 }}>
+                              <AlertTriangle size={11} style={{ verticalAlign: '-1px' }} /> {cancelInfo.message}
+                            </span>
+                          </>
+                        )}
+                      </div>
                     )}
                   </div>
                 </div>
@@ -116,6 +144,7 @@ const UserHistory = () => {
         .page-title { margin-top: 0; margin-bottom: 30px; font-size: 2.2rem; }
         .mb-40 { margin-bottom: 40px; }
         .mb-16 { margin-bottom: 16px; }
+        .mb-20 { margin-bottom: 20px; }
         .mx-auto { margin-left: auto; margin-right: auto; }
         .text-center { text-align: center; }
         
@@ -149,8 +178,8 @@ const UserHistory = () => {
         
         .hc-id { font-family: monospace; color: var(--text-muted); font-size: 0.9rem; }
         
-        .cancel-btn { display: flex; align-items: center; gap: 6px; background: rgba(239, 68, 68, 0.1); color: var(--status-red); border: 1px solid rgba(239, 68, 68, 0.3); padding: 6px 12px; border-radius: var(--radius-md); font-size: 0.85rem; cursor: pointer; transition: all 0.2s; font-family: inherit; font-weight: 600; margin-top: 4px; }
-        .cancel-btn:hover { background: rgba(239, 68, 68, 0.2); }
+        .cancel-btn { display: inline-flex; align-items: center; gap: 6px; background: rgba(239, 68, 68, 0.1); color: var(--status-red); border: 1px solid rgba(239, 68, 68, 0.3); padding: 6px 12px; border-radius: var(--radius-md); font-size: 0.85rem; cursor: pointer; transition: all 0.2s; font-family: inherit; font-weight: 600; }
+        .cancel-btn:hover:not(.disabled) { background: rgba(239, 68, 68, 0.2); }
       `}</style>
     </div>
   );

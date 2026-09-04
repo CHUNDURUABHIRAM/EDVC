@@ -6,8 +6,8 @@ import { useAuth } from '../../context/AuthContext';
  * Wraps protected pages. Redirects unauthenticated users to /auth.
  * Preserves the attempted URL so we can redirect back after login.
  */
-const ProtectedRoute = ({ children }) => {
-  const { isLoggedIn, loading } = useAuth();
+const ProtectedRoute = ({ children, allowedRoles }) => {
+  const { isLoggedIn, loading, user } = useAuth();
   const location = useLocation();
 
   if (loading) {
@@ -19,7 +19,18 @@ const ProtectedRoute = ({ children }) => {
   }
 
   if (!isLoggedIn) {
+    if (allowedRoles && allowedRoles.includes('admin') && !allowedRoles.includes('user')) {
+      return <Navigate to="/admin/login" state={{ from: location }} replace />;
+    }
     return <Navigate to="/auth" state={{ from: location }} replace />;
+  }
+
+  const role = user?.role || 'user';
+
+  if (allowedRoles && Array.isArray(allowedRoles) && !allowedRoles.includes(role)) {
+    // Send each role to their correct home dashboard
+    if (role === 'admin') return <Navigate to="/admin" replace />;
+    return <Navigate to="/dashboard" replace />;
   }
 
   return children;

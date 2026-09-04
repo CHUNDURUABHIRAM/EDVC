@@ -1,15 +1,21 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Sidebar from '../components/layout/Sidebar';
 import { useAuth } from '../context/AuthContext';
 import { handleBooking } from '../engines/AllocationEngine';
 import { predictWaitingTime } from '../engines/PredictiveEngine';
-import { Calendar, Clock, CreditCard, CheckCircle, ChevronLeft, ShieldAlert, Zap } from 'lucide-react';
+import { syncStations } from '../services/chargingStationApi';
+import { useAppState, appState } from '../services/appState';
+import {
+  getConnectorAvailability, calculateTotalPrice, calculateEnergyCost, parseBookingDateTime, SLOT_DURATION_MINUTES,
+} from '../engines/ReservationEngine';
+import { Calendar, Clock, CreditCard, CheckCircle, ChevronLeft, ShieldAlert, Zap, AlertTriangle } from 'lucide-react';
 
 const BookingFlow = () => {
   const { id } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
+  const { stations, bookings, queue: queues } = useAppState();
   
   const [station, setStation] = useState(null);
   const [step, setStep] = useState(1);
@@ -22,15 +28,66 @@ const BookingFlow = () => {
   const [bookingDetails, setBookingDetails] = useState(null);
 
   useEffect(() => {
-    const sts = JSON.parse(localStorage.getItem('chargeSpotStations') || '[]');
-    const found = sts.find(s => s.id === id);
-    setStation(found);
-    
-    // Default to today
-    const tzOffset = (new Date()).getTimezoneOffset() * 60000;
-    const localISOTime = (new Date(Date.now() - tzOffset)).toISOString().slice(0, 10);
-    setSelectedDate(localISOTime);
-  }, [id]);
+    const loadStation = async () => {
+      let found = stations.find(s => s.id === id);
+      if (!found) {
+        const { stations: synced } = await syncStations(null, true);
+        found = (synced || []).find(s => s.id === id);
+      }
+      setStation(found);
+      
+      const tzOffset = (new Date()).getTimezoneOffset() * 60000;
+      const localISOTime = (new Date(Date.now() - tzOffset)).toISOString().slice(0, 10);
+      setSelectedDate(localISOTime);
+    };
+    if (id) loadStation();
+  }, [id, stations]);
+
+  // Compute requested time interval as Date objects for use with ReservationEngine
+  const getRequestedInterval = () => {
+    if (!selectedDate || !selectedTime) return null;
+    const start = parseBookingDateTime(selectedDate, selectedTime);
+    if (!start) return null;
+    const end = new Date(start.getTime() + SLOT_DURATION_MINUTES * 60 * 1000);
+    return { start, end };
+  };
+
+  // Per-connector availability using the centralized ReservationEngine
+  const getConnectorAvailInfo = (chargerId) => {
+    if (!station || !chargerId) return null;
+    const connector = station.chargers?.find(c => c.id === chargerId);
+    if (!connector) return null;
+    const interval = getRequestedInterval();
+    return getConnectorAvailability(
+      connector, station,
+      interval?.start || null, interval?.end || null,
+      bookings
+    );
+  };
+
+  // Deterministic price from ReservationEngine (no Math.random(), falls back to ₹8.5/kWh)
+  const getEnergyCost = () => {
+    if (!selectedCharger || !station) return null;
+    const connector = station.chargers?.find(c => c.id === selectedCharger);
+    return calculateEnergyCost(connector);
+  };
+
+  const getTotalPrice = () => {
+    if (!selectedCharger || !station) return null;
+    const connector = station.chargers?.find(c => c.id === selectedCharger);
+    return calculateTotalPrice(connector);
+  };
+
+  // Current availability check for selected charger + selected time
+  const selectedChargerAvailInfo = useMemo(() => {
+    if (!selectedCharger || !selectedDate || !selectedTime || !station) return null;
+    return getConnectorAvailInfo(selectedCharger);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedCharger, selectedDate, selectedTime, bookings, station]);
+
+  const isSlotBlocked = selectedChargerAvailInfo && !selectedChargerAvailInfo.available;
+  const slotBlockReason = selectedChargerAvailInfo?.reason || '';
+  const slotBlockState = selectedChargerAvailInfo?.state || '';
 
   if (!station) return (
     <div className="page-layout booking-layout">
@@ -41,33 +98,70 @@ const BookingFlow = () => {
     </div>
   );
 
-  const getEstimatedPrice = () => {
-    if (!selectedCharger) return 0;
-    const charger = station.chargers.find(c => c.id === selectedCharger);
-    // Rough estimate: assume 30 kWh needed
-    return charger ? (charger.price * 30).toFixed(2) : 0;
-  };
-
   const handlePayment = async () => {
-    setError('');
-    setIsProcessing(true);
-    
-    // Simulate network delay
-    await new Promise(r => setTimeout(r, 1200)); 
-    
-    const res = handleBooking(station.id, selectedCharger, user.id, selectedDate, selectedTime);
-    
-    setIsProcessing(false);
-    
-    if (res.error) {
-      setError(res.error);
-    } else {
-      setBookingDetails(res);
-      setStep(3); // Success
+    // Final pre‑payment availability check (prevents race conditions)
+    if (isSlotBlocked) {
+      setError(slotBlockReason || 'This slot is no longer available.');
+      return;
+    }
+
+    try {
+      setIsProcessing(true);
+      setError('');
+
+      // Ensure a valid authenticated user exists
+      const { getAuth } = await import('firebase/auth');
+      const auth = getAuth();
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        throw new Error('Your session has expired. Please log in again.');
+      }
+      const uid = currentUser.uid;
+
+      // Build a complete user snapshot for the booking
+      const userSnapshot = {
+        userId: uid,
+        userName: user?.name || 'Unknown',
+        userEmail: user?.email || currentUser.email || '',
+        evModel: user?.evModel || 'Unknown EV',
+      };
+
+      // Simulate network delay (preserve original UX)
+      await new Promise(r => setTimeout(r, 1200));
+
+      const res = await handleBooking(
+        station.id,
+        selectedCharger,
+        userSnapshot,
+        selectedDate,
+        selectedTime,
+      );
+
+      if (!res) {
+        throw new Error('Booking service returned no response.');
+      }
+
+      if (res.error && !res.queued) {
+        setError(res.error);
+        return;
+      }
+
+      setBookingDetails({
+        ...res,
+        totalPaid: getTotalPrice(),
+        queued: !!res.queued,
+        position: res.position ?? null,
+      });
+      setStep(3);
+    } catch (e) {
+      console.error('[BOOKING CONFIRM ERROR]', e);
+      setError(e?.message || 'Failed to create booking. Please try again.');
+    } finally {
+      setIsProcessing(false);
     }
   };
 
-  const waitPrediction = predictWaitingTime(station);
+  const waitPrediction = predictWaitingTime(station, bookings, queues);
 
   return (
     <div className="page-layout booking-layout">
@@ -98,27 +192,67 @@ const BookingFlow = () => {
                 <label>Available Chargers</label>
                 <div className="charger-options">
                   {station.chargers.map(c => {
-                    const isAvail = c.status === 'AVAILABLE';
+                    const availInfo = selectedDate && selectedTime
+                      ? getConnectorAvailInfo(c.id)
+                      : null;
+                    const isCurrentlyBlocked = availInfo ? !availInfo.available : false;
+                    const isMaintOrOffline = c.operationalStatus === 'MAINTENANCE' || c.status === 'MAINTENANCE' || c.operationalStatus === 'OFFLINE' || c.status === 'OFFLINE';
                     const isSelected = selectedCharger === c.id;
+                    const blockState = availInfo?.state || '';
+                    
+                    // Badge text and color
+                    let badge = null;
+                    if (isMaintOrOffline) {
+                      badge = { text: c.status?.toUpperCase() || 'OFFLINE', color: 'var(--text-muted)' };
+                    } else if (blockState === 'ACTIVE_BOOKING') {
+                      badge = { text: 'IN USE', color: 'var(--status-red)' };
+                    } else if (blockState === 'FUTURE_RESERVATION') {
+                      badge = { text: 'RESERVED', color: '#f59e0b' };
+                    } else if (blockState === 'DOUBLE_BOOKING') {
+                      badge = { text: 'CONFLICT', color: 'var(--status-red)' };
+                    } else if (!isCurrentlyBlocked && availInfo) {
+                      badge = { text: 'AVAILABLE', color: 'var(--status-green)' };
+                    }
+
                     return (
-                      <div 
-                        key={c.id} 
-                        className={`charger-option ${isSelected ? 'selected' : ''} ${!isAvail ? 'dimmed' : ''}`}
-                        onClick={() => setSelectedCharger(c.id)}
-                      >
-                        <div className="co-left">
-                          <div className="co-id">{c.id}</div>
-                          <div className="co-info">
-                            <strong style={{ color: isSelected ? 'var(--text-main)' : 'var(--text-muted)' }}>{c.type}</strong>
-                            <span>{c.speed}</span>
+                      <div key={c.id}>
+                        <div 
+                          className={`charger-option ${isSelected ? 'selected' : ''} ${isCurrentlyBlocked || isMaintOrOffline ? 'dimmed' : ''}`}
+                          onClick={() => !(isMaintOrOffline) && setSelectedCharger(c.id)}
+                        >
+                          <div className="co-left">
+                            <div className="co-id">{c.id}</div>
+                            <div className="co-info">
+                              <strong style={{ color: isSelected ? 'var(--text-main)' : 'var(--text-muted)' }}>{c.type}</strong>
+                              <span>{c.speed}</span>
+                            </div>
+                          </div>
+                          <div className="co-right">
+                            <span style={{ fontSize: '0.85rem' }}>{isNaN(parseFloat(c.price)) ? c.price : `₹${c.price}/kWh`}</span>
+                            {badge && (
+                              <span style={{ fontSize: '0.72rem', fontWeight: 700, color: badge.color }}>{badge.text}</span>
+                            )}
                           </div>
                         </div>
-                        <div className="co-right">
-                          <span style={{ fontSize: '0.85rem' }}>₹{c.price}/kWh</span>
-                          {!isAvail && <span style={{ fontSize: '0.75rem', color: 'var(--status-orange)', fontWeight: 600 }}>IN USE</span>}
-                        </div>
+                        {/* Show detailed reason when this charger is selected and blocked */}
+                        {isSelected && isCurrentlyBlocked && availInfo && (
+                          <div style={{ margin: '4px 0 8px', padding: '10px 14px', background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: 8, fontSize: '0.83rem', color: '#f59e0b', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                            <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 2 }} />
+                            <div>
+                              <strong>Slot unavailable</strong> — {availInfo.reason}
+                              {availInfo.availableAfter && (
+                                <div style={{ marginTop: 4, color: 'var(--text-muted)' }}>
+                                  Available again after {availInfo.availableAfter.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
+                                </div>
+                              )}
+                              {blockState === 'FUTURE_RESERVATION' && (
+                                <div style={{ marginTop: 4, color: 'var(--text-muted)' }}>Try another available charger at this station.</div>
+                              )}
+                            </div>
+                          </div>
+                        )}
                       </div>
-                    )
+                    );
                   })}
                 </div>
               </div>
@@ -152,7 +286,7 @@ const BookingFlow = () => {
               <button 
                 className="btn-primary" 
                 style={{ width: '100%', marginTop: '24px', padding: '14px', fontSize: '1rem' }}
-                disabled={!selectedCharger || !selectedTime || !selectedDate}
+                disabled={!selectedCharger || !selectedTime || !selectedDate || isSlotBlocked}
                 onClick={() => setStep(2)}
               >
                 Continue to Payment
@@ -180,7 +314,7 @@ const BookingFlow = () => {
                 <div className="divider"></div>
                 <div className="summary-row">
                   <span className="s-label">Est. Energy Cost (30kWh)</span>
-                  <span className="s-value">₹{getEstimatedPrice()}</span>
+                  <span className="s-value">₹{getEnergyCost()?.toFixed(2) || '255.00'}</span>
                 </div>
                 <div className="summary-row">
                   <span className="s-label">Convenience Fee</span>
@@ -189,7 +323,7 @@ const BookingFlow = () => {
                 <div className="divider"></div>
                 <div className="total-row">
                   <span>Total to Pay Now</span>
-                  <span>₹25.00</span>
+                  <span>₹{getTotalPrice()?.toFixed(2) || '280.00'}</span>
                 </div>
               </div>
 
@@ -205,7 +339,7 @@ const BookingFlow = () => {
                 onClick={handlePayment}
                 disabled={isProcessing}
               >
-                {isProcessing ? <span className="spinner"></span> : <><CreditCard size={20}/> Pay ₹25.00 Securely</>}
+                {isProcessing ? <span className="spinner"></span> : <><CreditCard size={20}/> Pay ₹{getTotalPrice()?.toFixed(2) || '280.00'} Securely</>}
               </button>
               
               <button 
@@ -224,8 +358,13 @@ const BookingFlow = () => {
               <div className="icon-wrapper bg-primary-soft mx-auto" style={{ width: '80px', height: '80px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 24 }}>
                 <CheckCircle className="text-primary" size={40} />
               </div>
-              <h1 style={{ margin: '0 0 12px', fontSize: '2rem' }}>Booking Confirmed!</h1>
-              <p className="text-muted" style={{ fontSize: '1.1rem' }}>Your slot at {station.name} has been reserved.</p>
+              <h1 style={{ margin: '0 0 12px', fontSize: '2rem' }}>{bookingDetails.queued ? 'Waitlist Joined!' : 'Booking Request Sent!'}</h1>
+              <p className="text-muted" style={{ fontSize: '1.1rem', margin: 0 }}>
+                {bookingDetails.queued 
+                  ? `You are at position #${bookingDetails.position} in the virtual queue for ${station.name}.`
+                  : `Your slot request at ${station.name} is pending admin approval.`}
+              </p>
+              <p style={{ fontSize: '1.2rem', fontWeight: 'bold', color: 'var(--primary-color)', marginTop: '8px' }}>Amount: ₹{bookingDetails.totalPaid}</p>
               
               <div className="qr-box mx-auto" style={{ marginTop: 32, marginBottom: 32 }}>
                 <img src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${bookingDetails.id}&bgcolor=ffffff&color=111111`} alt="Booking QR" style={{ borderRadius: 12 }}/>

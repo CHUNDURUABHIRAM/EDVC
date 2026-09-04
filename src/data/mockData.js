@@ -198,38 +198,10 @@ export const mockStations = [
   }
 ];
 
-export const mockUser = {
-  id: "U-1234",
-  name: "Arjun Kumar",
-  email: "arjun@example.com",
-  phone: "+91 9876543210",
-  evModel: "Nexon EV Max",
-  batteryCapacity: 40.5, // kWh
-  currentBatteryPct: 35, // %
-  currentLocation: [12.9716, 77.5946], // Bengaluru center
-  preferredConnector: "CCS2"
-};
-
 // Start setting up initial localStorage config
-if (!localStorage.getItem('chargeSpotStations')) {
-  localStorage.setItem('chargeSpotStations', JSON.stringify(mockStations));
-}
-if (!localStorage.getItem('chargeSpotUser')) {
-  localStorage.setItem('chargeSpotUser', JSON.stringify(mockUser));
-}
+// We no longer seed chargeSpotStations with mock data. It must be fetched from OCM API.
 if (!localStorage.getItem('chargeSpotBookings')) {
-  // Pre-seed a completed booking so History page isn't empty on first load
-  const sampleBooking = {
-    id: 'BK-DEMO-0001',
-    stationId: 'ST-001',
-    chargerId: 'C1',
-    userId: mockUser.id,
-    date: new Date(Date.now() - 86400000 * 2).toISOString().split('T')[0],
-    time: '14:30',
-    status: 'COMPLETED',
-    createdAt: new Date(Date.now() - 86400000 * 2).toISOString(),
-  };
-  localStorage.setItem('chargeSpotBookings', JSON.stringify([sampleBooking]));
+  localStorage.setItem('chargeSpotBookings', JSON.stringify([]));
 }
 if (!localStorage.getItem('chargeSpotQueue')) {
   localStorage.setItem('chargeSpotQueue', JSON.stringify([]));

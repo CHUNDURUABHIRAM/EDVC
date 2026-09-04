@@ -13,31 +13,43 @@ import BookingFlow from './pages/BookingFlow';
 import UserHistory from './pages/UserHistory';
 import InnovationDemo from './pages/InnovationDemo';
 
+import AdminDashboard from './pages/admin/AdminDashboard';
+import AdminLogin from './pages/admin/AdminLogin';
+
+import ErrorBoundary from './components/common/ErrorBoundary';
+
 import './index.css';
 import './App.css';
 
 function App() {
   return (
-    <AuthProvider>
-      <BrowserRouter>
-        <Routes>
+    <ErrorBoundary>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
           {/* Public */}
           <Route path="/" element={<LandingPage />} />
           <Route path="/auth" element={<Auth />} />
 
           {/* Protected User Routes */}
-          <Route path="/dashboard" element={<ProtectedRoute><UserDashboard /></ProtectedRoute>} />
-          <Route path="/finder" element={<ProtectedRoute><StationFinder /></ProtectedRoute>} />
-          <Route path="/station/:id" element={<ProtectedRoute><StationDetails /></ProtectedRoute>} />
-          <Route path="/book/:id" element={<ProtectedRoute><BookingFlow /></ProtectedRoute>} />
-          <Route path="/history" element={<ProtectedRoute><UserHistory /></ProtectedRoute>} />
-          <Route path="/demo" element={<ProtectedRoute><InnovationDemo /></ProtectedRoute>} />
+          <Route path="/dashboard" element={<ProtectedRoute allowedRoles={['user', 'admin']}><UserDashboard /></ProtectedRoute>} />
+          <Route path="/finder" element={<ProtectedRoute allowedRoles={['user', 'admin']}><StationFinder /></ProtectedRoute>} />
+          <Route path="/station/:id" element={<ProtectedRoute allowedRoles={['user', 'admin']}><StationDetails /></ProtectedRoute>} />
+          <Route path="/book/:id" element={<ProtectedRoute allowedRoles={['user', 'admin']}><BookingFlow /></ProtectedRoute>} />
+          <Route path="/history" element={<ProtectedRoute allowedRoles={['user', 'admin']}><UserHistory /></ProtectedRoute>} />
+
+          {/* Protected Admin Routes */}
+          <Route path="/admin/login" element={<AdminLogin />} />
+          <Route path="/admin" element={<ProtectedRoute allowedRoles={['admin']}><AdminDashboard /></ProtectedRoute>} />
+          <Route path="/admin/smart-engine" element={<ProtectedRoute allowedRoles={['admin']}><InnovationDemo /></ProtectedRoute>} />
+          <Route path="/demo" element={<Navigate to="/admin/smart-engine" replace />} />
 
           {/* Catch-all */}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>
     </AuthProvider>
+    </ErrorBoundary>
   );
 }
 

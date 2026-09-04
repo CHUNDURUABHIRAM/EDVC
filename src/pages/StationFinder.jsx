@@ -1,13 +1,18 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MapContainer, TileLayer, Marker, Popup, ZoomControl } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, ZoomControl, useMap } from 'react-leaflet';
+import MarkerClusterGroup from 'react-leaflet-cluster';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import Sidebar from '../components/layout/Sidebar';
 import { useAuth } from '../context/AuthContext';
 import { calculateAvailabilityConfidence } from '../engines/AvailabilityEngine';
 import { predictWaitingTime, recommendBestStation } from '../engines/PredictiveEngine';
-import { Search, Filter, Map, List, Zap, Clock, ChevronRight, MapPin, BatteryCharging, X, SlidersHorizontal } from 'lucide-react';
+import { syncStations } from '../services/chargingStationApi';
+import { useAppState } from '../services/appState';
+import { getStationAvailableNow, getConnectorCurrentState } from '../engines/ReservationEngine';
+import { searchCityCoordinates } from '../services/geocodingService';
+import { Search, Filter, Map, List, Zap, Clock, ChevronRight, MapPin, BatteryCharging, X, SlidersHorizontal, Navigation, RefreshCw, AlertTriangle } from 'lucide-react';
 
 // Fix Leaflet default icon
 delete L.Icon.Default.prototype._getIconUrl;
@@ -18,17 +23,69 @@ L.Icon.Default.mergeOptions({
 });
 
 // Custom colored marker for station status
-const makeIcon = (color) => L.divIcon({
-  className: '',
-  html: `<div style="
-    width:32px;height:32px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);
-    background:${color};border:3px solid white;
-    box-shadow:0 2px 8px rgba(0,0,0,0.4);
-  "></div>`,
-  iconSize: [32, 32],
-  iconAnchor: [16, 32],
-  popupAnchor: [0, -36],
-});
+const makeIcon = (color, isUser = false) => {
+  if (isUser) {
+    return L.divIcon({
+      className: '',
+      html: `<div style="
+        width:24px;height:24px;border-radius:50%;
+        background:${color};border:4px solid white;
+        box-shadow:0 2px 8px rgba(0,0,0,0.5);
+      "></div>`,
+      iconSize: [24, 24],
+      iconAnchor: [12, 12],
+      popupAnchor: [0, -12],
+    });
+  }
+  return L.divIcon({
+    className: '',
+    html: `<div style="
+      width:32px;height:32px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);
+      background:${color};border:3px solid white;
+      box-shadow:0 2px 8px rgba(0,0,0,0.4);
+    "></div>`,
+    iconSize: [32, 32],
+    iconAnchor: [16, 32],
+    popupAnchor: [0, -36],
+  });
+};
+
+const MapBounds = ({ stations, center }) => {
+  const map = useMap();
+  useEffect(() => {
+    if (stations && stations.length > 0) {
+      // Filter out extreme outliers (e.g. coordinates in Africa or 0,0) for bounds calculation
+      // India roughly spans Lat 6 to 38, Lng 68 to 98. We allow a slightly wider bounding box to be safe.
+      const validCoords = stations
+        .map(s => s.coordinates)
+        .filter(c => 
+          c && c.length >= 2 && 
+          c[0] >= -90 && c[0] <= 90 && 
+          c[1] >= -180 && c[1] <= 180 && 
+          !(c[0] === 0 && c[1] === 0) &&
+          // Indian Subcontinent constraint to prevent Africa zoom issue
+          c[0] > 0 && c[0] < 40 && c[1] > 60 && c[1] < 100
+        );
+
+      if (validCoords.length > 0) {
+        const bounds = L.latLngBounds(validCoords);
+        if (center && center[0] > 0 && center[0] < 40 && center[1] > 60 && center[1] < 100) {
+          bounds.extend(center);
+        }
+        map.fitBounds(bounds, { padding: [50, 50], maxZoom: 14 });
+      } else if (center && center[0] >= -90 && center[0] <= 90 && center[1] >= -180 && center[1] <= 180 && !(center[0] === 0 && center[1] === 0)) {
+        map.setView(center, 13);
+      } else {
+        map.setView([20.5937, 78.9629], 5); // India default
+      }
+    } else if (center && center[0] >= -90 && center[0] <= 90 && center[1] >= -180 && center[1] <= 180 && !(center[0] === 0 && center[1] === 0)) {
+      map.setView(center, 13);
+    } else {
+      map.setView([20.5937, 78.9629], 5);
+    }
+  }, [stations, center, map]);
+  return null;
+};
 
 const statusColors = {
   'AVAILABLE': '#10b981',
@@ -42,7 +99,7 @@ const statusColors = {
 const StationFinder = () => {
   const navigate = useNavigate();
   const { user } = useAuth();
-  const [stations, setStations] = useState([]);
+  const { stations, bookings, queue: queues } = useAppState();
   const [viewMode, setViewMode] = useState('map');
   const [showFilters, setShowFilters] = useState(false);
 
@@ -53,22 +110,92 @@ const StationFinder = () => {
   const [filterCity, setFilterCity] = useState('ALL');
   const [sortBy, setSortBy] = useState('recommended');
 
+  const [isSearchingLocation, setIsSearchingLocation] = useState(false);
+  const [mapCenter, setMapCenter] = useState([20.5937, 78.9629]); // Center of India
+  const [userLocation, setUserLocation] = useState(null);
+  const [apiError, setApiError] = useState(null);
+
+  const fetchData = async (coords = null) => {
+     if (coords) setMapCenter(coords);
+     const { stations: sts, error } = await syncStations(coords, !coords); // pass fetchIndiaWide
+     if (error && (!sts || sts.length === 0)) {
+       setApiError(error);
+     } else {
+       setApiError(null);
+     }
+  };
+
+  const handleMyLocation = () => {
+    if (navigator?.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          if (pos?.coords?.latitude && pos?.coords?.longitude) {
+            const coords = [pos.coords.latitude, pos.coords.longitude];
+            setMapCenter(coords);
+            setUserLocation(coords);
+            setSearchQuery('');
+          }
+        },
+        (err) => console.warn("MyLocation error:", err),
+        { timeout: 5000 }
+      );
+    }
+  };
+
+  const handleSearchSubmit = async (e) => {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+    setIsSearchingLocation(true);
+    const coords = await searchCityCoordinates(searchQuery);
+    setIsSearchingLocation(false);
+    if (coords) {
+      fetchData(coords);
+    }
+  };
+
   useEffect(() => {
-    const sts = JSON.parse(localStorage.getItem('chargeSpotStations') || '[]');
-    setStations(sts);
+    const load = async () => {
+       // Fetch India-wide OCM results as requested
+       fetchData(null);
+       
+       if (navigator?.geolocation) {
+         try {
+           const pos = await new Promise((resolve) => {
+             navigator.geolocation.getCurrentPosition(resolve, () => resolve(null), { timeout: 4000 });
+           });
+           if (pos?.coords?.latitude && pos?.coords?.longitude) {
+             const coords = [pos.coords.latitude, pos.coords.longitude];
+             setMapCenter(coords);
+             setUserLocation(coords);
+           }
+         } catch (e) {}
+       }
+    };
+    load();
   }, []);
 
   const cities = useMemo(() => {
-    const all = [...new Set(stations.map(s => s.city))].sort();
+    const all = [...new Set(stations.map(s => s.city))].filter(Boolean).sort();
     return ['ALL', ...all];
   }, [stations]);
 
   const processedStations = useMemo(() => {
-    if (!stations.length) return [];
-    // Run recommendation engine for scoring/distances
-    const ranked = recommendBestStation(stations, user || { currentLocation: [12.9716, 77.5946], preferredConnector: 'CCS2' });
+    const isValid = (st) => {
+      if (!st || typeof st !== 'object' || !st.id || !st.name) return false;
+      if (!Array.isArray(st.coordinates) || st.coordinates.length < 2) return false;
+      const lat = st.coordinates[0];
+      const lng = st.coordinates[1];
+      if (typeof lat !== 'number' || typeof lng !== 'number') return false;
+      if (isNaN(lat) || isNaN(lng) || !isFinite(lat) || !isFinite(lng)) return false;
+      if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+      if (!Array.isArray(st.chargers)) return false;
+      return true;
+    };
+    const validSts = stations.filter(isValid);
+    const refCoords = mapCenter && isValid({id:'x', name:'x', coordinates: mapCenter, chargers:[]}) ? mapCenter : [20.5937, 78.9629]; // Center of India fallback
+    const ranked = recommendBestStation(validSts, { ...user, currentLocation: refCoords }, bookings, queues);
     return ranked;
-  }, [stations, user]);
+  }, [stations, user, mapCenter, bookings, queues]);
 
   const filteredStations = useMemo(() => {
     return processedStations.filter(st => {
@@ -86,14 +213,14 @@ const StationFinder = () => {
       if (filterSpeed === 'FAST') {
         if (!st.chargers.some(c => parseInt(c.speed) >= 50 && parseInt(c.speed) < 150)) return false;
       } else if (filterSpeed === 'ULTRA') {
-        if (!st.chargers.some(c => parseInt(c.speed) >= 150)) return false;
+        if (!st.chargers?.some(c => parseInt(c.speed) >= 150)) return false;
       } else if (filterSpeed === 'SLOW') {
-        if (!st.chargers.some(c => parseInt(c.speed) <= 22)) return false;
+        if (!st.chargers?.some(c => parseInt(c.speed) <= 22)) return false;
       }
 
       // Availability filter
       if (filterAvailability !== 'ALL') {
-        const result = calculateAvailabilityConfidence(st);
+        const result = calculateAvailabilityConfidence(st, bookings, queues);
         if (filterAvailability === 'AVAILABLE' && result.status !== 'AVAILABLE' && result.status !== 'LIKELY AVAILABLE') return false;
         if (filterAvailability === 'LIMITED' && result.status !== 'LIMITED') return false;
         if (filterAvailability === 'OCCUPIED' && result.status !== 'OCCUPIED' && result.status !== 'LIKELY OCCUPIED') return false;
@@ -109,7 +236,7 @@ const StationFinder = () => {
       if (sortBy === 'price') return parseFloat(a.avgPrice) - parseFloat(b.avgPrice);
       return b.recommendationScore - a.recommendationScore; // recommended (default)
     });
-  }, [processedStations, searchQuery, filterSpeed, filterAvailability, filterCity, sortBy]);
+  }, [processedStations, searchQuery, filterSpeed, filterAvailability, filterCity, sortBy, bookings, queues]);
 
   const hasActiveFilters = filterSpeed !== 'ALL' || filterAvailability !== 'ALL' || filterCity !== 'ALL' || sortBy !== 'recommended';
 
@@ -129,23 +256,34 @@ const StationFinder = () => {
       <div className="finder-content">
         {/* Header bar */}
         <div className="finder-header glass-panel">
-          <div className="search-wrap">
+          <form className="search-wrap" onSubmit={handleSearchSubmit}>
             <Search size={18} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
             <input
               type="text"
-              placeholder="Search by station name, city, or location..."
+              placeholder="Search by city (e.g. Bhimavaram, Vijayawada)..."
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
               className="search-input"
             />
+            {isSearchingLocation && (
+              <span style={{ fontSize: '0.8rem', color: 'var(--primary-color)' }}>Searching...</span>
+            )}
             {searchQuery && (
-              <button className="clear-search" onClick={() => setSearchQuery('')}>
+              <button type="button" className="clear-search" onClick={() => setSearchQuery('')}>
                 <X size={16} />
               </button>
             )}
-          </div>
+          </form>
 
           <div className="header-controls">
+            <button
+              className="filter-toggle-btn"
+              onClick={handleMyLocation}
+              title="Recenter map to my location"
+            >
+              <Navigation size={16} /> My Location
+            </button>
+
             <button
               className={`filter-toggle-btn ${showFilters ? 'active' : ''} ${hasActiveFilters ? 'has-filters' : ''}`}
               onClick={() => setShowFilters(s => !s)}
@@ -211,9 +349,13 @@ const StationFinder = () => {
         )}
 
         {/* Result count */}
-        <div className="result-count">
+        <div className="result-count" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
           <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
             Showing <strong style={{ color: 'var(--text-main)' }}>{filteredStations.length}</strong> of {stations.length} stations
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85rem', color: 'var(--text-muted)', background: 'var(--glass-bg)', padding: '6px 12px', borderRadius: '20px', border: '1px solid var(--glass-border)' }}>
+            <div style={{ width: '14px', height: '14px', borderRadius: '50%', backgroundColor: '#3b82f6', border: '2px solid white', boxShadow: '0 1px 4px rgba(0,0,0,0.4)' }}></div>
+            Blue indicator represents your present location
           </span>
         </div>
 
@@ -222,49 +364,80 @@ const StationFinder = () => {
           {viewMode === 'map' ? (
             <div className="map-container glass-panel">
               <MapContainer
-                center={[20.5937, 78.9629]}
-                zoom={5}
+                center={mapCenter}
+                zoom={9}
+                key={`${mapCenter[0]}-${mapCenter[1]}`}
                 style={{ height: '100%', width: '100%', borderRadius: '12px' }}
                 zoomControl={false}
               >
                 <ZoomControl position="bottomright" />
+                <MapBounds stations={filteredStations} center={mapCenter} />
                 <TileLayer
                   attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                  url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
                 />
-                {filteredStations.map(station => {
-                  const result = calculateAvailabilityConfidence(station);
-                  const color = getStatusColor(result.status);
-                  return (
-                    <Marker key={station.id} position={station.coordinates} icon={makeIcon(color)}>
-                      <Popup minWidth={220}>
-                        <div style={{ fontFamily: 'Inter, sans-serif', padding: '4px' }}>
-                          <h3 style={{ margin: '0 0 4px', fontSize: '1rem', color: '#111' }}>{station.name}</h3>
-                          <p style={{ margin: '0 0 8px', fontSize: '0.85rem', color: '#555' }}>
-                            <MapPin size={12} /> {station.location}
-                          </p>
-                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: `${color}22`, color, padding: '3px 10px', borderRadius: 999, fontSize: '0.78rem', fontWeight: 700, marginBottom: 8 }}>
-                            <div style={{ width: 7, height: 7, borderRadius: '50%', background: color }} />
-                            {result.status} · {result.score}%
+                {userLocation && (
+                  <Marker position={userLocation} icon={makeIcon('#3b82f6', true)}>
+                    <Popup>Your Location</Popup>
+                  </Marker>
+                )}
+                <Marker position={[20.5937, 78.9629]} icon={makeIcon('#10b981', false)}>
+                  <Popup>India Center</Popup>
+                </Marker>
+                <MarkerClusterGroup
+                  chunkedLoading
+                  maxClusterRadius={40}
+                  showCoverageOnHover={false}
+                >
+                  {filteredStations.map(station => {
+                    const c = station.coordinates;
+                    // Do not render outlier markers (e.g. 0,0 or Africa) on the India-focused map
+                    if (!c || c.length < 2 || c[0] === 0 || c[1] === 0 || c[0] < 0 || c[0] > 40 || c[1] < 60 || c[1] > 100) return null;
+                    const result = calculateAvailabilityConfidence(station, bookings, queues);
+                    const color = getStatusColor(result.status);
+                    return (
+                      <Marker key={station.id} position={station.coordinates} icon={makeIcon(color)}>
+                        <Popup minWidth={220}>
+                          <div style={{ fontFamily: 'Inter, sans-serif', padding: '4px' }}>
+                            <h3 style={{ margin: '0 0 4px', fontSize: '1rem', color: '#111' }}>{station.name}</h3>
+                            <p style={{ margin: '0 0 8px', fontSize: '0.85rem', color: '#555' }}>
+                              <MapPin size={12} /> {station.location}
+                            </p>
+                            <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, background: `${color}22`, color, padding: '3px 10px', borderRadius: 999, fontSize: '0.78rem', fontWeight: 700, marginBottom: 8 }}>
+                              <div style={{ width: 7, height: 7, borderRadius: '50%', background: color }} />
+                              {result.status} · {result.score}%
+                            </div>
+                            <div style={{ fontSize: '0.82rem', color: '#666', marginBottom: 10 }}>
+                              ₹{(station.chargers.reduce((a, c) => a + c.price, 0) / station.chargers.length).toFixed(1)}/kWh · {station.chargers.length} chargers
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                              <button
+                                style={{ background: '#10b981', color: 'white', border: 'none', borderRadius: 8, padding: '8px', fontWeight: 600, cursor: 'pointer', fontSize: '0.85rem' }}
+                                onClick={() => navigate(`/station/${station.id}`)}
+                              >View Details</button>
+                              <button
+                                style={{ 
+                                  background: result.status === 'AVAILABLE' || result.status === 'LIMITED' ? '#f0fdf4' : '#f3f4f6', 
+                                  color: result.status === 'AVAILABLE' || result.status === 'LIMITED' ? '#10b981' : '#9ca3af', 
+                                  border: `1px solid ${result.status === 'AVAILABLE' || result.status === 'LIMITED' ? '#10b981' : '#d1d5db'}`, 
+                                  borderRadius: 8, padding: '8px', fontWeight: 600, 
+                                  cursor: result.status === 'AVAILABLE' || result.status === 'LIMITED' ? 'pointer' : 'not-allowed', 
+                                  fontSize: '0.85rem' 
+                                }}
+                                onClick={() => {
+                                  if (result.status === 'AVAILABLE' || result.status === 'LIMITED') {
+                                    navigate(`/book/${station.id}`);
+                                  }
+                                }}
+                                disabled={result.status !== 'AVAILABLE' && result.status !== 'LIMITED'}
+                              >Book Now</button>
+                            </div>
                           </div>
-                          <div style={{ fontSize: '0.82rem', color: '#666', marginBottom: 10 }}>
-                            ₹{(station.chargers.reduce((a, c) => a + c.price, 0) / station.chargers.length).toFixed(1)}/kWh · {station.chargers.length} chargers
-                          </div>
-                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                            <button
-                              style={{ background: '#10b981', color: 'white', border: 'none', borderRadius: 8, padding: '8px', fontWeight: 600, cursor: 'pointer', fontSize: '0.85rem' }}
-                              onClick={() => navigate(`/station/${station.id}`)}
-                            >View Details</button>
-                            <button
-                              style={{ background: '#f0fdf4', color: '#10b981', border: '1px solid #10b981', borderRadius: 8, padding: '8px', fontWeight: 600, cursor: 'pointer', fontSize: '0.85rem' }}
-                              onClick={() => navigate(`/book/${station.id}`)}
-                            >Book Now</button>
-                          </div>
-                        </div>
-                      </Popup>
-                    </Marker>
-                  );
-                })}
+                        </Popup>
+                      </Marker>
+                    );
+                  })}
+                </MarkerClusterGroup>
               </MapContainer>
             </div>
           ) : (
@@ -278,9 +451,9 @@ const StationFinder = () => {
                 </div>
               ) : (
                 filteredStations.map(station => {
-                  const result = calculateAvailabilityConfidence(station);
+                  const result = calculateAvailabilityConfidence(station, bookings);
                   const color = getStatusColor(result.status);
-                  const availableChargers = station.chargers.filter(c => c.status === 'AVAILABLE').length;
+                  const availableChargers = result.metrics?.availableConnectors ?? ((station.networkApiStatus === 'OFFLINE' || station.networkApiStatus === 'MAINTENANCE') ? 0 : getStationAvailableNow(station, bookings));
                   return (
                     <div key={station.id} className="list-card glass-panel" onClick={() => navigate(`/station/${station.id}`)}>
                       <div className="list-card-left">
@@ -294,7 +467,7 @@ const StationFinder = () => {
                               <span
                                 key={i}
                                 className="c-badge"
-                                style={{ opacity: c.status === 'OFFLINE' ? 0.4 : 1 }}
+                                style={{ opacity: getConnectorCurrentState(c, station.id, bookings) === 'OFFLINE' ? 0.4 : 1 }}
                               >
                                 {c.speed}
                               </span>
@@ -313,10 +486,20 @@ const StationFinder = () => {
                       <div className="list-card-actions">
                         <button
                           className="btn-primary"
-                          style={{ padding: '8px 16px', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: 6 }}
-                          onClick={e => { e.stopPropagation(); navigate(`/book/${station.id}`); }}
+                          style={{ 
+                            padding: '8px 16px', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: 6,
+                            opacity: result.status === 'AVAILABLE' || result.status === 'LIMITED' ? 1 : 0.5,
+                            cursor: result.status === 'AVAILABLE' || result.status === 'LIMITED' ? 'pointer' : 'not-allowed'
+                          }}
+                          onClick={e => { 
+                            e.stopPropagation(); 
+                            if (result.status === 'AVAILABLE' || result.status === 'LIMITED') {
+                              navigate(`/book/${station.id}`); 
+                            }
+                          }}
+                          disabled={result.status !== 'AVAILABLE' && result.status !== 'LIMITED'}
                         >
-                          <BatteryCharging size={14} /> Book
+                          <BatteryCharging size={14} /> {result.status === 'AVAILABLE' || result.status === 'LIMITED' ? 'Book' : 'Unavailable'}
                         </button>
                         <ChevronRight size={20} style={{ color: 'var(--text-muted)' }} />
                       </div>

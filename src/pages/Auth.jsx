@@ -6,7 +6,7 @@ import { useAuth } from '../context/AuthContext';
 const Auth = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { isLoggedIn, login, register, loginAsDemo } = useAuth();
+  const { isLoggedIn, user, login, register, loginAsAdmin } = useAuth();
 
   const [isLogin, setIsLogin] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
@@ -17,13 +17,19 @@ const Auth = () => {
     name: '', email: '', password: '', phone: '', evModel: '',
   });
 
+  const getRoleRedirect = (role) => {
+    if (role === 'admin') return '/admin';
+    return '/dashboard';
+  };
+
   // If already logged in, redirect away
   useEffect(() => {
-    if (isLoggedIn) {
-      const from = location.state?.from?.pathname || '/dashboard';
+    if (isLoggedIn && user) {
+      const defaultPath = getRoleRedirect(user.role);
+      const from = location.state?.from?.pathname || defaultPath;
       navigate(from, { replace: true });
     }
-  }, [isLoggedIn]);
+  }, [isLoggedIn, user, navigate, location]);
 
   const handleChange = (e) => {
     setForm(f => ({ ...f, [e.target.name]: e.target.value }));
@@ -35,15 +41,14 @@ const Auth = () => {
     setError('');
     setIsLoading(true);
 
-    await new Promise(r => setTimeout(r, 600)); // simulate network
-
     if (isLogin) {
-      const result = login(form.email, form.password);
+      const result =await login(form.email, form.password);
       if (!result.success) {
         setError(result.error);
         setIsLoading(false);
         return;
       }
+      // Login succeeded — useEffect will trigger redirect via isLoggedIn
     } else {
       if (!form.name || !form.email || !form.password) {
         setError('Please fill in all required fields.');
@@ -55,7 +60,7 @@ const Auth = () => {
         setIsLoading(false);
         return;
       }
-      const result = register({
+      const result = await register({
         name: form.name,
         email: form.email,
         password: form.password,
@@ -68,19 +73,8 @@ const Auth = () => {
         return;
       }
     }
-
-    const from = location.state?.from?.pathname || '/dashboard';
-    navigate(from, { replace: true });
-  };
-
-  const handleDemoLogin = async () => {
-    setIsLoading(true);
-    await new Promise(r => setTimeout(r, 600));
-    const result = loginAsDemo();
-    if (!result.success) {
-      setError('Could not load demo user. Please refresh.');
-    }
     setIsLoading(false);
+    // Redirect handled by useEffect watching isLoggedIn + user
   };
 
   const switchMode = () => {
@@ -156,23 +150,31 @@ const Auth = () => {
           </button>
         </form>
 
-        <div className="divider-row">
-          <div className="divider-line" />
-          <span>OR</span>
-          <div className="divider-line" />
-        </div>
-
-        <button className="btn-secondary demo-btn" onClick={handleDemoLogin} disabled={isLoading}>
-          <span className="demo-avatar">A</span>
-          Continue as Demo User (Arjun Kumar)
-        </button>
-
         <p className="switch-text">
           {isLogin ? "Don't have an account? " : "Already have an account? "}
-          <button type="button" className="link-btn" onClick={switchMode}>
+          <button type="button" className="switch-btn" onClick={() => {
+            setIsLogin(!isLogin);
+            setError('');
+          }}>
             {isLogin ? 'Register' : 'Login'}
           </button>
         </p>
+
+        <div className="divider-row" style={{ marginTop: '20px' }}>
+          <div className="divider-line" />
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>ADMINISTRATION</span>
+          <div className="divider-line" />
+        </div>
+
+        <button 
+          type="button" 
+          className="btn-secondary" 
+          style={{ width: '100%', padding: '12px', fontSize: '0.9rem', marginTop: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+          onClick={() => navigate('/admin/login')}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          Go to Admin Portal
+        </button>
       </div>
 
       <style>{`
@@ -339,29 +341,6 @@ const Auth = () => {
           flex: 1;
           height: 1px;
           background: var(--border-color);
-        }
-        .demo-btn {
-          width: 100%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 12px;
-          padding: 12px;
-          font-size: 0.95rem;
-        }
-        .demo-btn:disabled { opacity: 0.6; cursor: not-allowed; }
-        .demo-avatar {
-          width: 28px;
-          height: 28px;
-          border-radius: 50%;
-          background: var(--primary-color);
-          color: white;
-          font-weight: 700;
-          font-size: 0.9rem;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          flex-shrink: 0;
         }
         .switch-text {
           text-align: center;

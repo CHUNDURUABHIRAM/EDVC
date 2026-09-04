@@ -4,7 +4,11 @@ import Sidebar from '../components/layout/Sidebar';
 import { useAuth } from '../context/AuthContext';
 import { calculateAvailabilityConfidence } from '../engines/AvailabilityEngine';
 import { predictWaitingTime } from '../engines/PredictiveEngine';
-import { joinQueue, leaveQueue, getQueuePosition, getQueueLength } from '../engines/AllocationEngine';
+import { getStationQueueCount } from '../engines/StateEngine';
+import { getConnectorCurrentState } from '../engines/ReservationEngine';
+import { useAppState, appState } from '../services/appState';
+
+import { syncStations } from '../services/chargingStationApi';
 import { MapPin, Clock, Zap, Star, ShieldCheck, ChevronLeft, Navigation, AlertTriangle, Coffee, Wifi, Car, BatteryCharging, Users } from 'lucide-react';
 
 const icons = {
@@ -23,23 +27,73 @@ const StationDetails = () => {
   const { id } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
+  const { stations, bookings } = useAppState();
   
   const [station, setStation] = useState(null);
   const [queuePos, setQueuePos] = useState(null);
-  const [qLength, setQLength] = useState(0);
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
-    const sts = JSON.parse(localStorage.getItem('chargeSpotStations') || '[]');
-    const found = sts.find(s => s.id === id);
-    setStation(found);
-    
-    if (user && found) {
-      setQueuePos(getQueuePosition(found.id, user.id));
-      setQLength(getQueueLength(found.id));
-    }
-  }, [id, user]);
+    let isMounted = true;
+    const loadStation = async () => {
+      if (!isMounted) return;
+      setIsLoading(true);
+      setError(null);
+      
+      try {
+        // Normalize: accept both "OCM-309387" and "309387"
+        const normalizedId = id
+          ? id.toString().startsWith('OCM-') ? id.toString() : `OCM-${id}`
+          : '';
+        const rawId = normalizedId.replace('OCM-', '');
 
-  if (!station) return (
+        const matchId = (s) => s.id === normalizedId || s.id === rawId;
+
+        // 1. Check canonical in-memory store directly (avoids reactive loop)
+        let found = (appState.getStations() || []).find(matchId);
+
+        // 2. If not in store, fetch from API (merges into global store, does NOT replace it)
+        if (!found) {
+          try {
+            const { stations: synced } = await syncStations();
+            if (!isMounted) return;
+            found = (synced || []).find(matchId);
+            // Also re-check the full store after sync (syncStations merges into global)
+            if (!found) {
+              found = (appState.getStations() || []).find(matchId);
+            }
+          } catch (apiErr) {
+            console.warn('[StationDetails] API sync failed, will show not-found:', apiErr);
+          }
+        }
+
+        if (!isMounted) return;
+
+        if (found) {
+          setStation(found);
+        } else {
+          setError('Station not found');
+        }
+      } catch (err) {
+        console.error('[StationDetails] Error loading station:', err);
+        if (isMounted) setError('Failed to load station data');
+      } finally {
+        if (isMounted) setIsLoading(false);
+      }
+    };
+
+    loadStation();
+
+    return () => {
+      isMounted = false;
+    };
+  // Only re-run when the ID in the URL changes — NOT when reactive stations updates
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  if (isLoading) return (
     <div className="page-layout details-layout">
       <Sidebar />
       <div className="main-content details-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -48,8 +102,18 @@ const StationDetails = () => {
     </div>
   );
 
-  const engineResult = calculateAvailabilityConfidence(station);
-  const waitPrediction = predictWaitingTime(station);
+  if (error || !station) return (
+    <div className="page-layout details-layout">
+      <Sidebar />
+      <div className="main-content details-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column' }}>
+        <h2 style={{ color: 'var(--text-main)', marginBottom: 16 }}>Station not found</h2>
+        <button className="btn-primary" onClick={() => navigate('/finder')}>Back to Find Chargers</button>
+      </div>
+    </div>
+  );
+
+  const engineResult = calculateAvailabilityConfidence(station, bookings);
+  const waitPrediction = predictWaitingTime(station, bookings);
   
   const getStatusColor = (status) => {
     if (status === "AVAILABLE" || status === "LIKELY AVAILABLE") return "var(--status-green)";
@@ -58,21 +122,8 @@ const StationDetails = () => {
     return "var(--status-red)";
   };
 
-  const handleJoinQueue = () => {
-    const res = joinQueue(station.id, user.id);
-    if (res.success) {
-      setQueuePos(res.position);
-      setQLength(getQueueLength(station.id));
-    } else {
-      alert(res.error);
-    }
-  };
+  const userBooking = bookings.find(b => b.userId === user?.id && b.stationId === station.id && (b.status === 'CONFIRMED' || b.status === 'ACTIVE' || b.status === 'AT_RISK'));
 
-  const handleLeaveQueue = () => {
-    leaveQueue(station.id, user.id);
-    setQueuePos(null);
-    setQLength(getQueueLength(station.id));
-  };
 
   return (
     <div className="page-layout details-layout">
@@ -93,8 +144,20 @@ const StationDetails = () => {
           <p className="text-muted flex-row"><MapPin size={16}/> {station.location}, {station.city}</p>
           
           <div className="action-row">
-            <button className="btn-primary" onClick={() => navigate(`/book/${station.id}`)}>
-              <BatteryCharging size={18}/> Book Slot
+            <button 
+              className="btn-primary" 
+              onClick={() => {
+                if (engineResult.status === 'AVAILABLE' || engineResult.status === 'LIMITED') {
+                  navigate(`/book/${station.id}`);
+                }
+              }}
+              style={{
+                opacity: engineResult.status === 'AVAILABLE' || engineResult.status === 'LIMITED' ? 1 : 0.5,
+                cursor: engineResult.status === 'AVAILABLE' || engineResult.status === 'LIMITED' ? 'pointer' : 'not-allowed'
+              }}
+              disabled={engineResult.status !== 'AVAILABLE' && engineResult.status !== 'LIMITED'}
+            >
+              <BatteryCharging size={18}/> {engineResult.status === 'AVAILABLE' || engineResult.status === 'LIMITED' ? 'Book Slot' : 'Unavailable'}
             </button>
             <button className="btn-secondary" onClick={() => window.open(`https://maps.google.com/?q=${station.coordinates[0]},${station.coordinates[1]}`, '_blank')}>
               <Navigation size={18}/> Navigate
@@ -151,33 +214,27 @@ const StationDetails = () => {
                 <Users size={20} className="text-muted"/>
                 <div>
                   <div className="info-title">Virtual Queue</div>
-                  <div className="info-val">{qLength} waiting</div>
+                  <div className="info-val">{getStationQueueCount(station.id, bookings)} waiting</div>
                 </div>
               </div>
             </div>
 
-            {/* Queue Actions */}
-            {engineResult.status !== 'AVAILABLE' && (
-              <div className="queue-panel glass-panel mt-20">
+            {/* User Reservation Info */}
+            {userBooking && (
+              <div className="queue-panel glass-panel mt-20" style={{ borderLeft: '4px solid var(--primary-color)' }}>
                 <div className="queue-header">
                   <div>
-                    <h3 style={{ margin: '0 0 4px', fontSize: '1.1rem' }}>Virtual Queue</h3>
-                    <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-muted)' }}>Get notified when a slot opens up.</p>
+                    <h3 style={{ margin: '0 0 4px', fontSize: '1.1rem' }}>Your Reservation</h3>
+                    <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-muted)' }}>You have a {userBooking.status.toLowerCase()} booking.</p>
                   </div>
-                  {queuePos ? (
-                    <div className="queue-badge bg-primary-soft text-primary">
-                      Position #{queuePos}
-                    </div>
-                  ) : (
-                    <button className="btn-primary btn-sm" onClick={handleJoinQueue}>Join Queue</button>
-                  )}
+                  <div className="queue-badge bg-primary-soft text-primary">
+                    {userBooking.date} {userBooking.time}
+                  </div>
                 </div>
-                {queuePos && (
-                  <div className="queue-active mt-16">
-                    <p style={{ margin: '0 0 12px', fontSize: '0.9rem' }}>You will be notified when it's your turn.</p>
-                    <button className="btn-secondary btn-sm" onClick={handleLeaveQueue}>Leave Queue</button>
-                  </div>
-                )}
+                <div className="queue-active mt-16">
+                  <p style={{ margin: '0 0 12px', fontSize: '0.9rem' }}>Connector: <strong>{userBooking.chargerId}</strong></p>
+                  <button className="btn-secondary btn-sm" onClick={() => navigate('/dashboard')}>Manage Booking</button>
+                </div>
               </div>
             )}
 
@@ -186,12 +243,13 @@ const StationDetails = () => {
               <h3>Chargers ({station.chargers.length})</h3>
               <div className="charger-grid">
                 {station.chargers.map(c => {
-                  const cColor = c.status === 'AVAILABLE' ? 'var(--status-green)' : c.status === 'OFFLINE' ? 'var(--status-gray)' : 'var(--status-red)';
+                  const state = getConnectorCurrentState(c, station.id, bookings);
+                  const cColor = state === 'AVAILABLE' ? 'var(--status-green)' : state === 'OFFLINE' ? 'var(--status-gray)' : 'var(--status-red)';
                   return (
                     <div key={c.id} className="charger-card">
                       <div className="c-head">
                         <span className="c-id">{c.id}</span>
-                        <span className="badge-status" style={{ backgroundColor: `${cColor}22`, color: cColor }}>{c.status}</span>
+                        <span className="badge-status" style={{ backgroundColor: `${cColor}22`, color: cColor }}>{state}</span>
                       </div>
                       <div className="c-body">
                         <div>Type: <strong>{c.type}</strong></div>

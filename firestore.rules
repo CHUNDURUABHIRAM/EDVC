@@ -1,0 +1,38 @@
+// Firestore security rules for ChargeSpot
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // User profile documents
+    match /users/{uid} {
+      allow read: if request.auth.uid == uid || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+      allow write: if request.auth.uid == uid;
+    }
+
+    // Bookings collection
+    match /bookings/{bookingId} {
+      // Require authentication
+      allow read: if request.auth != null && (
+          resource.data.userId == request.auth.uid ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        );
+
+      // Create: user must be owner and include all required fields
+      allow create: if request.auth != null && request.resource.data.userId == request.auth.uid &&
+        request.resource.data.keys().hasAll([
+          'userId','userName','userEmail','evModel','stationId','chargerId',
+          'date','time','status','energyNeed','pricePerKWh','energyCost',
+          'convenienceFee','totalPrice','createdAt','updatedAt'
+        ]);
+
+      // Update/Delete: owner or admin, and must maintain required fields
+      allow update, delete: if request.auth != null && (
+        request.resource.data.userId == request.auth.uid ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      ) && request.resource.data.keys().hasAll([
+          'userId','userName','userEmail','evModel','stationId','chargerId',
+          'date','time','status','energyNeed','pricePerKWh','energyCost',
+          'convenienceFee','totalPrice','createdAt','updatedAt'
+        ]);
+    }
+  }
+}

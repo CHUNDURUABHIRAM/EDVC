@@ -1,0 +1,6 @@
+{
+  "projectId": "chargespot-2ea27",
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}
